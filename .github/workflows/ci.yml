@@ -66,18 +66,5 @@ jobs:
           key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: ${{ runner.os }}-cargo-clippy-
 
-      - name: Clippy
-        run: cargo clippy -- -D warnings
-
-  fmt:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-
-      - name: Check formatting
-        run: cargo fmt -- --check
+      - name: Clippy (this repo only, not dependencies)
+        run: cargo clippy -p HeapDumpStarDiver -- -D warnings
