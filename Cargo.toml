@@ -3,13 +3,23 @@ name = "HeapDumpStarDiver"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "heappy"
+path = "src/main.rs"
+
 [dependencies]
 arrow-array = "54.0.0"
+arrow-cast = { version = "54.0.0", features = ["prettyprint"] }
 arrow-schema = "54.0.0"
 jvm-hprof = { version = "0.1.0", path = "../../bitbucket/jvm-hprof-rs-li-hackweek" }
 memmap = "0.7.0"
 parquet = "54.0.0"
-clap = "4.5.27"
+clap = { version = "4.5.27", features = ["derive"] }
 rayon = "1.10"
 dashmap = "6"
 crossbeam-channel = "0.5"
+duckdb = { version = "1.1", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+libc = "0.2"
