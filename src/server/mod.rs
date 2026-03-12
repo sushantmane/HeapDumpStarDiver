@@ -32,15 +32,17 @@ impl HeappyServer {
             let _ = std::fs::remove_file(&socket_path);
         }
 
-        eprintln!("Registering parquet tables from {}...", canonical.display());
-        let engine = DuckDbParquetEngine::new(&canonical)?;
+        eprintln!("Indexing parquet tables from {}...", canonical.display());
+        let mut engine = DuckDbParquetEngine::new(&canonical)?;
+        // Server mode: eagerly register all views (one-time cost, amortized across queries)
+        let registered = engine.register_all();
         eprintln!(
             "Registered {} tables. Starting server on {}",
-            engine.table_count(),
+            registered,
             socket_path.display()
         );
 
-        let server = HeappyServer {
+        let mut server = HeappyServer {
             engine,
             socket_path: socket_path.clone(),
             pid_path: pid_path.clone(),
@@ -91,7 +93,7 @@ impl HeappyServer {
     /// Returns true if shutdown was requested. Never returns Err — connection
     /// errors are logged and the server continues accepting.
     fn handle_connection(
-        &self,
+        &mut self,
         stream: std::os::unix::net::UnixStream,
         start_time: Instant,
     ) -> bool {

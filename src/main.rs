@@ -125,7 +125,7 @@ fn load_hprof(file_path: &str) -> jvm_hprof::Hprof<'static> {
 }
 
 fn cmd_query_parquet(parquet_dir: &PathBuf, sql: &str, json_output: bool, no_server: bool) {
-    let engine = if no_server {
+    let mut engine = if no_server {
         let canonical = std::fs::canonicalize(parquet_dir)
             .unwrap_or_else(|e| {
                 eprintln!("Error: cannot resolve path {}: {}", parquet_dir.display(), e);

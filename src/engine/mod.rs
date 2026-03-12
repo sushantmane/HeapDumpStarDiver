@@ -3,18 +3,22 @@ pub mod duckdb_client;
 use duckdb::{Connection, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::server::protocol::ColumnMeta;
 
 // ---------------------------------------------------------------------------
-// DuckDbParquetEngine — registers parquet files as DuckDB views
+// DuckDbParquetEngine — lazy on-demand view registration
 // ---------------------------------------------------------------------------
 
 pub struct DuckDbParquetEngine {
     conn: Connection,
-    table_count: usize,
     parquet_dir: PathBuf,
+    /// table_name → list of parquet file paths (built at startup, cheap)
+    file_index: HashMap<String, Vec<PathBuf>>,
+    /// Which views have already been registered in DuckDB
+    registered: HashSet<String>,
 }
 
 impl DuckDbParquetEngine {
@@ -22,36 +26,112 @@ impl DuckDbParquetEngine {
         let conn = Connection::open_in_memory()?;
         let canonical = std::fs::canonicalize(parquet_dir)?;
 
-        let table_count = register_parquet_views(&conn, &canonical)?;
+        // Only build the file index — no CREATE VIEW calls
+        let file_index = build_file_index(&canonical)?;
+        let total = file_index.len();
+        eprintln!("Indexed {} tables from {}", total, canonical.display());
 
         Ok(DuckDbParquetEngine {
             conn,
-            table_count,
             parquet_dir: canonical,
+            file_index,
+            registered: HashSet::new(),
         })
     }
 
     pub fn table_count(&self) -> usize {
-        self.table_count
+        self.file_index.len()
+    }
+
+    pub fn registered_count(&self) -> usize {
+        self.registered.len()
     }
 
     pub fn parquet_dir(&self) -> &Path {
         &self.parquet_dir
     }
 
+    /// Register all views eagerly (for server mode where startup cost is amortized).
+    pub fn register_all(&mut self) -> usize {
+        let names: Vec<String> = self.file_index.keys().cloned().collect();
+        for name in &names {
+            self.register_view(name);
+        }
+        self.registered.len()
+    }
+
+    /// Register a single view by table name. Returns true if newly registered.
+    fn register_view(&mut self, table_name: &str) -> bool {
+        if self.registered.contains(table_name) {
+            return false;
+        }
+        if let Some(files) = self.file_index.get(table_name) {
+            let sql = if files.len() == 1 {
+                format!(
+                    "CREATE VIEW \"{}\" AS SELECT * FROM read_parquet('{}')",
+                    table_name,
+                    files[0].display()
+                )
+            } else {
+                let file_list: Vec<String> = files
+                    .iter()
+                    .map(|f| format!("'{}'", f.display()))
+                    .collect();
+                format!(
+                    "CREATE VIEW \"{}\" AS SELECT * FROM read_parquet([{}])",
+                    table_name,
+                    file_list.join(",")
+                )
+            };
+
+            match self.conn.execute(&sql, params![]) {
+                Ok(_) => {
+                    self.registered.insert(table_name.to_string());
+                    true
+                }
+                Err(e) => {
+                    eprintln!("Warning: failed to register {}: {}", table_name, e);
+                    false
+                }
+            }
+        } else {
+            false
+        }
+    }
+
     /// Execute a SQL query and return JSON rows with column metadata.
-    /// Uses query_arrow for reliable schema access, then converts to JSON.
+    /// On "table not found" errors, lazily registers the missing view and retries.
     pub fn query_json(
+        &mut self,
+        sql: &str,
+    ) -> Result<(Vec<ColumnMeta>, Vec<Value>), Box<dyn std::error::Error>> {
+        // Try up to 10 times (each attempt may discover one missing table)
+        for _attempt in 0..10 {
+            match self.execute_query(sql) {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if let Some(table_name) = extract_missing_table(&msg) {
+                        if self.register_view(&table_name) {
+                            continue; // retry with newly registered view
+                        }
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Err("Too many missing table retries".into())
+    }
+
+    fn execute_query(
         &self,
         sql: &str,
     ) -> Result<(Vec<ColumnMeta>, Vec<Value>), Box<dyn std::error::Error>> {
         use duckdb::arrow::array::Array;
-        use duckdb::arrow::datatypes::DataType;
 
         let mut stmt = self.conn.prepare(sql)?;
         let arrow_result = stmt.query_arrow(params![])?;
 
-        // Get schema from the arrow result
         let schema = arrow_result.get_schema();
         let columns_meta: Vec<ColumnMeta> = schema
             .fields()
@@ -82,6 +162,27 @@ impl DuckDbParquetEngine {
 
         Ok((columns_meta, rows_out))
     }
+}
+
+/// Extract table name from DuckDB "Catalog Error" messages.
+/// e.g. "Catalog Error: Table with name foo does not exist!"
+/// Also handles: "Table \"foo\" does not exist"
+fn extract_missing_table(err: &str) -> Option<String> {
+    // Pattern 1: "Table with name X does not exist"
+    if let Some(start) = err.find("Table with name ") {
+        let rest = &err[start + 16..];
+        if let Some(end) = rest.find(" does not exist") {
+            return Some(rest[..end].to_string());
+        }
+    }
+    // Pattern 2: 'Table "X" does not exist'
+    if let Some(start) = err.find("Table \"") {
+        let rest = &err[start + 7..];
+        if let Some(end) = rest.find("\" does not exist") {
+            return Some(rest[..end].to_string());
+        }
+    }
+    None
 }
 
 fn arrow_value_to_json(
@@ -164,15 +265,11 @@ fn arrow_value_to_json(
     }
 }
 
-/// Register all parquet files in a directory as DuckDB views.
-/// Returns the number of tables registered.
-fn register_parquet_views(
-    conn: &Connection,
+/// Build a file index mapping table names to their parquet file paths.
+/// This is a fast directory scan — no DuckDB calls.
+fn build_file_index(
     parquet_dir: &Path,
-) -> Result<usize, Box<dyn std::error::Error>> {
-    let mut count = 0;
-
-    // Collect parquet files
+) -> Result<HashMap<String, Vec<PathBuf>>, Box<dyn std::error::Error>> {
     let entries: Vec<_> = std::fs::read_dir(parquet_dir)?
         .filter_map(|e| e.ok())
         .filter(|e| {
@@ -183,9 +280,7 @@ fn register_parquet_views(
         })
         .collect();
 
-    // Group files by base name (for chunked robo-mode files)
-    let mut groups: std::collections::HashMap<String, Vec<PathBuf>> =
-        std::collections::HashMap::new();
+    let mut groups: HashMap<String, Vec<PathBuf>> = HashMap::new();
 
     for entry in &entries {
         let path = entry.path();
@@ -198,43 +293,11 @@ fn register_parquet_views(
             stem.clone()
         };
 
-        groups.entry(base).or_default().push(path);
+        let table_name = sanitize_table_name(&base);
+        groups.entry(table_name).or_default().push(path);
     }
 
-    for (base_name, files) in &groups {
-        // Table name: sanitize for SQL (replace dots with underscores)
-        let table_name = sanitize_table_name(base_name);
-
-        // Use explicit file lists instead of globs — globs cause O(n) directory
-        // scans per view which is catastrophically slow in large directories
-        // (37K files: glob = 37ms/view, explicit = 0.3ms/view → 148x faster)
-        let sql = if files.len() == 1 {
-            format!(
-                "CREATE VIEW \"{}\" AS SELECT * FROM read_parquet('{}')",
-                table_name,
-                files[0].display()
-            )
-        } else {
-            let file_list: Vec<String> = files
-                .iter()
-                .map(|f| format!("'{}'", f.display()))
-                .collect();
-            format!(
-                "CREATE VIEW \"{}\" AS SELECT * FROM read_parquet([{}])",
-                table_name,
-                file_list.join(",")
-            )
-        };
-
-        match conn.execute(&sql, params![]) {
-            Ok(_) => count += 1,
-            Err(e) => {
-                eprintln!("Warning: failed to register {}: {}", table_name, e);
-            }
-        }
-    }
-
-    Ok(count)
+    Ok(groups)
 }
 
 /// Sanitize a parquet base name into a valid DuckDB table name.
@@ -269,7 +332,7 @@ pub enum EngineVariant {
 impl EngineVariant {
     /// Execute a SQL query and return JSON rows with column metadata.
     pub fn query_json(
-        &self,
+        &mut self,
         sql: &str,
     ) -> Result<(Vec<ColumnMeta>, Vec<Value>), Box<dyn std::error::Error>> {
         match self {
